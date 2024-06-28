@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from json import dumps as json_dumps
 from random import random
 from typing import ClassVar, Mapping, Optional, Tuple, Type
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from requests.exceptions import HTTPError
 
@@ -53,6 +53,7 @@ from streamlink.utils.url import update_qsd
 log = logging.getLogger(__name__)
 
 LOW_LATENCY_MAX_LIVE_EDGE = 2
+STREAMLINK_TTVLOL_VERSION = "22519a70-master"
 
 
 @dataclass
@@ -270,6 +271,64 @@ class UsherService:
 
     def video(self, video_id, **extra_params):
         return self._create_url(f"/vod/{video_id}", **extra_params)
+
+
+class NoPlaylistProxyAvailable(Exception):
+    """
+    No playlist proxies available.
+    """
+
+
+class PlaylistProxyService:
+    def __init__(self, session, playlist_proxies, excluded_channels, fallback):
+        self.session = session
+        self.playlist_proxies = playlist_proxies or []
+        self.excluded_channels = map(str.lower, excluded_channels or [])
+        self.fallback = fallback
+
+    def _append_query_params(self, url):
+        params = {
+            "allow_source": "true",
+            "allow_audio_only": "true",
+            "fast_bread": "true",
+        }
+        req = self.session.http.prepare_new_request(url=url, params=params)
+
+        return req.url
+
+    def streams(self, channel, **kwargs):
+        if not self.playlist_proxies:
+            raise NoPlaylistProxyAvailable
+
+        if channel in self.excluded_channels:
+            log.info(f"Channel {channel} excluded from playlist proxy")
+            raise NoPlaylistProxyAvailable
+
+        log.debug(f"Getting live HLS streams for {channel}")
+        self.session.http.headers.update({
+            "referer": "https://player.twitch.tv",
+            "origin": "https://player.twitch.tv",
+        })
+        for proxy in self.playlist_proxies:
+            url = re.sub(r"\[channel\]", channel, proxy)
+            parsed_url = urlparse(url)
+
+            if url == proxy:
+                url = quote(self._append_query_params(url + f"/playlist/{channel}.m3u8"), safe=":/")
+            elif not parsed_url.query:
+                url = self._append_query_params(url)
+
+            log.info(f"Using playlist proxy '{parsed_url.scheme}://{parsed_url.netloc}'")
+            try:
+                return TwitchHLSStream.parse_variant_playlist(self.session, url, **kwargs)
+            except OSError as err:
+                log.error(err)
+
+        if self.fallback:
+            log.info("No playlist proxies available, falling back to Twitch servers")
+            raise NoPlaylistProxyAvailable
+
+        raise NoStreamsError
 
 
 class TwitchAPI:
@@ -723,6 +782,45 @@ class TwitchClientIntegrity:
     action="store_true",
     help="Purge cached Twitch client-integrity token and acquire a new one.",
 )
+@pluginargument(
+    "proxy-playlist",
+    metavar="URLS",
+    type="comma_list",
+    help="""
+        Proxy the playlist request through a server specified at <URL>.
+
+        If the URL has no path the playlist will be requested using the TTVLOL API.
+        If the URL path includes [channel] the playlist will not be requested with the TTVLOL API and
+        [channel] will be replaced with the channel name at runtime.
+
+        Can be multiple comma separated server URLs to be used as fallback.
+
+        When used the Twitch GraphQL API will not be called.
+        Only livestreams will use the playlist proxy, VODs and clips will use upstream behavior.
+        Integrity token retrieval will not be attempted.
+        --twitch-api-header, --twitch-access-token-param, and --twitch-purge-client-integrity will have no effect.
+        It will also not be possible to check for subscriber only streams.
+    """,
+)
+@pluginargument(
+    "proxy-playlist-exclude",
+    metavar="CHANNELS",
+    type="comma_list",
+    help="""
+        Exclude specified channel(s) from playlist proxy and fallback to upstream behavior.
+
+        Can be multiple comma separated channel names.
+
+        Useful if you're subscribed to the channel(s) and want to use your OAuth token to avoid ads instead.
+    """,
+)
+@pluginargument(
+    "proxy-playlist-fallback",
+    action="store_true",
+    help="""
+        Fallback to Twitch servers if all requests to playlist proxies fail.
+    """,
+)
 class Twitch(Plugin):
     _CACHE_KEY_CLIENT_INTEGRITY = "client-integrity"
 
@@ -734,6 +832,9 @@ class Twitch(Plugin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        log.info(f"streamlink-ttvlol {STREAMLINK_TTVLOL_VERSION} ({self.session.version})")
+        log.info("Please report issues to https://github.com/2bc4/streamlink-ttvlol/issues")
 
         params = parse_qsd(urlparse(self.url).query)
 
@@ -756,6 +857,12 @@ class Twitch(Plugin):
             access_token_param=self.get_option("access-token-param"),
         )
         self.usher = UsherService(session=self.session)
+        self.playlist_proxy = PlaylistProxyService(
+                session=self.session,
+                playlist_proxies=self.get_option("proxy-playlist"),
+                excluded_channels=self.get_option("proxy-playlist-exclude"),
+                fallback=self.get_option("proxy-playlist-fallback"),
+        )
 
         self._checked_metadata = False
 
@@ -915,7 +1022,14 @@ class Twitch(Plugin):
         elif self.clip_id:
             return self._get_clips()
         elif self.channel:
-            return self._get_hls_streams_live()
+            try:
+                return self.playlist_proxy.streams(
+                    channel=self.channel,
+                    disable_ads=self.get_option("disable-ads"),
+                    low_latency=self.get_option("low-latency"),
+                )
+            except NoPlaylistProxyAvailable:
+                return self._get_hls_streams_live()
 
 
 __plugin__ = Twitch
